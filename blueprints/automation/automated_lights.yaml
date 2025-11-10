@@ -1,0 +1,316 @@
+blueprint:
+  name: "Automated Lights"
+  description: >-
+    Control lighting via Home Assistant Scenes based on occupancy and optional motion sensors.
+    Four scenarios: occupied/moving, occupied/not moving, not occupied/moving, not occupied/not moving.
+    Supports a global override trigger that respects outside-light and home-presence conditions.
+    Adds a default fallback to apply a "scene.all_off" scene if no other condition matches.
+    Sensors default to filler entities, but logic will gracefully bypass them if unused (i.e., left empty).
+    Improved template and variable handling for reliability and future Home Assistant compatibility.
+
+  domain: automation
+
+  input:
+    # NEW: Area selection. If this area is currently in input_text.general_light_management (manual list),
+    # this automation will do nothing (skip all actions).
+    target_area:
+      name: Target Area
+      description: If this area is present in input_text.general_light_management, skip all actions.
+      selector:
+        area: {}
+
+    occupancy_sensor:
+      name: Occupancy Sensor
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: occupancy
+
+    moving_sensor:
+      name: Moving Occupancy Sensor (optional)
+      description: Optional motion/moving sensor. If left as the default filler entity, it will be ignored safely.
+      default: binary_sensor.filler_moving
+      selector:
+        entity:
+          domain: binary_sensor
+          device_class: moving
+
+    off_delay:
+      name: Delay before marking Not Occupied (minutes)
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: minutes
+
+    motion_off_delay:
+      name: Delay before marking Not Moving (minutes)
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: minutes
+
+    on_occupancy_actions:
+      name: Actions on Occupancy On
+      default: []
+      selector:
+        action: {}
+
+    off_occupancy_actions:
+      name: Actions on Occupancy Off
+      default: []
+      selector:
+        action: {}
+
+    on_moving_actions:
+      name: Actions on Moving On
+      default: []
+      selector:
+        action: {}
+
+    off_moving_actions:
+      name: Actions on Moving Off
+      default: []
+      selector:
+        action: {}
+
+    disable_globally_allowed:
+      name: Disable global guard (outside-light and home-presence)
+      description: When true, bypasses the outside-light and someone-home checks.
+      default: false
+      selector:
+        boolean: {}
+
+    disable_move_cheks:
+      name: Disable motion checks
+      description: When true, treat the area as "not moving" and ignore the motion sensor.
+      default: true
+      selector:
+        boolean: {}
+
+# Triggers:
+# - Occupancy on/off (with delay for off)
+# - Motion on/off (with delay for off) — only meaningful if a real sensor is configured
+# - Global override button — re-evaluates conditions immediately (requires 2s stable)
+trigger:
+  - platform: state
+    entity_id: !input occupancy_sensor
+    to: "on"
+    id: occupied
+
+  - platform: state
+    entity_id: !input occupancy_sensor
+    to: "off"
+    id: not_occupied
+    for:
+      minutes: !input off_delay
+
+  - platform: state
+    entity_id: !input moving_sensor
+    to: "on"
+    id: moving
+
+  - platform: state
+    entity_id: !input moving_sensor
+    to: "off"
+    id: not_moving
+    for:
+      minutes: !input motion_off_delay
+
+  - platform: state
+    entity_id:
+      - input_button.general_global_override_trigger
+    id: global_override
+    for:
+      seconds: 2
+
+# Variables:
+# Normalize input names, compute guard flags, and derive readable booleans.
+variables:
+  # Raw inputs normalized to explicit names
+  occupancy_entity: !input occupancy_sensor
+  motion_entity: !input moving_sensor
+
+  # Input delays (minutes)
+  occupancy_off_delay_minutes: !input off_delay
+  motion_off_delay_minutes: !input motion_off_delay
+
+  # Feature flags (normalized; keep original input name for compatibility)
+  disable_motion_checks: !input disable_move_cheks
+  disable_global_guard: !input disable_globally_allowed
+
+  # Helper: is the motion sensor set to a real entity?
+  motion_sensor_configured: >-
+    {{ motion_entity != 'binary_sensor.filler_moving' and motion_entity not in ['', none] }}
+
+  # Occupancy and motion state booleans
+  occupancy_active: >-
+    {{ is_state(occupancy_entity, 'on') }}
+
+  motion_active: >-
+    {{ motion_sensor_configured and is_state(motion_entity, 'on') }}
+
+  # Elapsed timers for off states (in seconds compared to configured delays)
+  occupancy_off_elapsed: >-
+    {{ (as_timestamp(now()) - as_timestamp(states[occupancy_entity].last_changed)) > (occupancy_off_delay_minutes | float * 60) }}
+
+  motion_off_elapsed: >-
+    {{ disable_motion_checks
+       or (not motion_sensor_configured)
+       or ((as_timestamp(now()) - as_timestamp(states[motion_entity].last_changed)) > (motion_off_delay_minutes | float * 60)) }}
+
+  # Global guard (outside light off AND someone home) unless disabled
+  globally_allowed: >-
+    {{ disable_global_guard
+       or (is_state('binary_sensor.general_light_outside', 'off')
+           and is_state('binary_sensor.general_someone_home', 'on')) }}
+
+  # Area selection and manual override list membership
+  target_area: !input target_area
+
+  # NEW: Area-based manual override guard (reads input_text.general_light_management built by your manual-change listener)
+  # Improved resolution:
+  # - The area selector provides an area_id. The management list may contain either the human area name or the area_id.
+  # - This block attempts to resolve a human area name by looking up an entity in the selected area and using its area name.
+  # - If no entity is found, it falls back to comparing the raw area_id.
+  manual_override_present: >-
+    {% set sel = target_area %}
+    {% if sel in ['', none] %}
+      false
+    {% else %}
+      {# sel is an area_id string from the area selector. Try to find an entity that belongs to that area. #}
+      {% set sel_id = sel %}
+      {% set entities_in_area = (states | selectattr('attributes.area_id', 'equalto', sel_id) | map(attribute='entity_id') | list) %}
+      {# If we found at least one entity in the area, get its area name (human-readable). Otherwise fall back. #}
+      {% if entities_in_area | length > 0 %}
+        {% set sel_name = area_name(entities_in_area[0]) or sel_id %}
+      {% else %}
+        {% set sel_name = (area_name(sel_id) if (area_name is defined) else none) or sel_id %}
+      {% endif %}
+
+      {% set raw = states('input_text.general_light_management') %}
+      {% if raw in ['unknown', 'unavailable', none] %}
+        {% set raw = '' %}
+      {% endif %}
+      {% set items = (raw.split(';') | map('trim') | reject('equalto','') | list) %}
+      {% set items_lower = items | map('lower') | list %}
+      {{ sel_name|lower in items_lower or sel_id|lower in items_lower }}
+    {% endif %}
+
+  # Continue only if area is NOT in the manual list or no area selected.
+  # If true, we skip all actions (manual control is active for the selected area).
+  skip_due_to_manual_override: >-
+    {{ target_area not in ['', none] and manual_override_present }}
+
+  retry_interval: 0.5
+  retry_time: 2
+
+# Actions:
+# Ordered evaluation of scenarios. The first matching branch runs.
+# Multiple repeated scene/action executions with short delays are intentional to improve reliability of scene application.
+action:
+  - choose:
+      # Short-circuit — do nothing if the selected area is under manual control
+      - conditions:
+          - condition: template
+            alias: "Skip all actions if target area is in manual override list"
+            value_template: "{{ skip_due_to_manual_override }}"
+        sequence: []
+
+      # Occupied + Not Moving:
+      # - Applies if global guard passes AND occupancy is on AND
+      #   (motion checks are disabled OR no motion sensor is configured OR we are not moving and the not-moving delay has elapsed).
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ globally_allowed
+                 and occupancy_active
+                 and (disable_motion_checks
+                      or (not motion_sensor_configured)
+                      or ((not motion_active) and motion_off_elapsed)) }}
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              until: "{{ (as_timestamp(now()) - start_ts) > (retry_time | float) }}"
+              sequence:
+                - sequence: !input on_occupancy_actions
+                - delay: "{{ retry_interval | float }}"
+
+      # Occupied + Moving:
+      # - Only when motion checks are enabled AND a real motion sensor is configured AND it is actively reporting ON.
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ globally_allowed
+                 and occupancy_active
+                 and (not disable_motion_checks)
+                 and motion_sensor_configured
+                 and motion_active }}
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              until: "{{ (as_timestamp(now()) - start_ts) > (retry_time | float) }}"
+              sequence:
+                - sequence: !input on_moving_actions
+                - delay: "{{ retry_interval | float }}"
+
+      # Not Occupied + Moving:
+      # - Occupancy is OFF for at least the configured off delay, and motion is actively ON (with checks enabled).
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ globally_allowed
+                 and (not occupancy_active)
+                 and occupancy_off_elapsed
+                 and (not disable_motion_checks)
+                 and motion_sensor_configured
+                 and motion_active }}
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              until: "{{ (as_timestamp(now()) - start_ts) > (retry_time | float) }}"
+              sequence:
+                - sequence: !input on_moving_actions
+                - delay: "{{ retry_interval | float }}"
+
+      # Not Occupied + Not Moving:
+      # - Occupancy is OFF for at least the configured off delay, and either motion checks are disabled,
+      #   no motion sensor is configured, or motion is OFF with the not-moving delay elapsed.
+      - conditions:
+          - condition: template
+            value_template: >-
+              {{ globally_allowed
+                 and (not occupancy_active)
+                 and occupancy_off_elapsed
+                 and (disable_motion_checks
+                      or (not motion_sensor_configured)
+                      or ((not motion_active) and motion_off_elapsed)) }}
+        sequence:
+          - variables:
+              start_ts: "{{ as_timestamp(now()) }}"
+          - repeat:
+              until: "{{ (as_timestamp(now()) - start_ts) > (retry_time | float) }}"
+              sequence:
+                - sequence: !input off_occupancy_actions
+                - sequence: !input off_moving_actions
+                - delay: "{{ retry_interval | float }}"
+
+    # Fallback: always turn off as safe state if no above matches
+    default:
+      - variables:
+          start_ts: "{{ as_timestamp(now()) }}"
+      - repeat:
+          until: "{{ (as_timestamp(now()) - start_ts) > (retry_time | float) }}"
+          sequence:
+            - sequence: !input off_occupancy_actions
+            - sequence: !input off_moving_actions
+            - delay: "{{ retry_interval | float }}"
+
+# Mode: restart ensures re-evaluation on new triggers
+mode: restart
